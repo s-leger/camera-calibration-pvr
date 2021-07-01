@@ -1,5 +1,6 @@
 # Blender Plugin: Camera Calibration with Perspective Views of Rectangles
 # Copyright (C) 2017  Marco Rossini
+# Blender 2.8+ compatibility by Stephen Leger
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -24,13 +25,15 @@
 import bpy
 import mathutils
 from math import sqrt, pi, atan2, degrees
+from bpy_extras.io_utils import ImportHelper
+
 
 bl_info = {
     "name": "Camera Calibration using Perspective Views of Rectangles",
     "author": "Marco Rossini",
-    "version": (0, 4, 0),
+    "version": (0, 5, 0),
     # "warning": "This is an unreleased development version.",
-    "blender": (2, 7, 0),
+    "blender": (2, 80, 0),
     "location": "3D View > Tools Panel > Tools (Or custom panel category) ",
     "description": "Calibrates position, rotation and focal length of a camera using a single image of a rectangle.",
     "wiki_url": "https://github.com/mrossini-ethz/camera-calibration-pvr",
@@ -288,6 +291,7 @@ def solve_FY_V(pa, pb, pc, pd, pe, pf, scale):
     print("focal", focal)
     return (focal, optical_centre, shift)
 
+
 def solve_FXY_VV(vertices, attached_vertices, dangling_vertices, scale):
     # Get the 3 vanishing points
     v1 = get_vanishing_point(vertices[0], vertices[3], vertices[1], vertices[2])
@@ -394,14 +398,16 @@ def get_lambda_d(pa, pb, pc, pd, scale, focal_length):
         print("Badness:", badness)
         solutions.append((badness, [ra, rb, rc, rd]))
     # Chose solution with best score
-    best_badness = solutions[0][0]
-    best_index = 0
-    for i in range(1, len(solutions)):
-        if best_badness > solutions[i][0]:
-            best_index = i
-            best_badness = solutions[i][0]
+    solutions.sort(key=lambda x: x[0])
+    return solutions[0][1]
+    # best_badness = solutions[0][0]
+    # best_index = 0
+    # for i in range(1, len(solutions)):
+    #    if best_badness > solutions[i][0]:
+    #        best_index = i
+    #        best_badness = solutions[i][0]
     # Return the best solution
-    return solutions[best_index][1]
+    # return solutions[best_index][1]
 
 def get_transformation(ra, rb, rc, rd):
     """Average the vectors AD, BC and AB, DC and normalize them"""
@@ -491,35 +497,17 @@ def calibrate_camera_FXY_PR_VV(vertices, attached_vertices, dangling_vertices, s
 
 # Get the background images
 def get_background_image_data(context):
-    bkg_images = context.space_data.background_images
-    if len(bkg_images) == 1:
-        # If there is only one background image, take that one
-        img = bkg_images[0]
-    else:
-        # Get the visible background images with view axis 'top'
-        bkg_images_top = []
-        for img in bkg_images:
-            if (img.view_axis == "TOP" or img.view_axis == "ALL") and img.show_background_image:
-                bkg_images_top.append(img)
-        # Check the number of images
-        if len(bkg_images_top) != 1:
-            # Check only the TOP images
-            bkg_images_top = []
-            for img in bkg_images:
-                if img.view_axis == "TOP" and img.show_background_image:
-                    bkg_images_top.append(img)
-            if len(bkg_images_top) != 1:
-                return None
-        # Get the background image properties
-        img = bkg_images_top[0]
-    offx = img.offset_x
-    offy = img.offset_y
-    rot = img.rotation
-    scale = img.size
-    flipx = img.use_flip_x
-    flipy = img.use_flip_y
-    w, h = img.image.size
-    return (offx, offy, rot, scale, flipx, flipy, w, h)
+    for o in context.scene.objects:
+        if o.type == "EMPTY" and o.empty_display_type == "IMAGE" and o.visible_get():
+            offx = o.empty_image_offset[0]
+            offy = o.empty_image_offset[1]
+            rot = 0 # img.rotation
+            scale = o.empty_display_size #img.size
+            flipx = False #img.use_flip_x
+            flipy = False #img.use_flip_y
+            w, h = o.data.size
+            return (o, offx, offy, rot, scale, flipx, flipy, w, h)
+    return None
 
 def vertex_apply_transformation(p, scale, rotation, translation):
     # Make a copy of the vertex
@@ -601,7 +589,7 @@ def set_camera_parameters(camera, lens = 35.0, shift_x = 0.0, shift_y = 0.0, sen
 
 def set_camera_transformation(camera_obj, translation, rotation):
     """Transforms the camera object according to the given parameters"""
-    camera_obj.location = translation
+    camera_obj.matrix_world.translation = translation
     camera_obj.rotation_euler = rotation
 
 def get_vertical_mode_matrix(is_vertical, camera_rotation):
@@ -621,16 +609,26 @@ def get_vertical_mode_matrix(is_vertical, camera_rotation):
     else:
         return mathutils.Matrix().Identity(3)
 
+
+def update_camera_bg(camera, image):
+    camera.data.show_background_images = True
+    for im in camera.data.background_images:
+        if im == image:
+            return
+    bg = camera.data.background_images.new()
+    bg.image = image
+    
+
 def update_scene(camera, cam_pos, cam_rot, is_vertical, scene, img_width, img_height, object_name, coords, size_factor):
     """Updates the scene by moving the camera and creating a new rectangle"""
     # Get the 3D cursor location
-    cursor_pos = bpy.context.space_data.cursor_location
+    cursor_pos = bpy.context.scene.cursor.location
     # Get transformation matrix for vertical orientation
     vert_matrix = get_vertical_mode_matrix(is_vertical, cam_rot)
     # Set the camera position and rotation
     cam_rot = cam_rot.copy()
     cam_rot.rotate(vert_matrix)
-    set_camera_transformation(camera, vert_matrix * cam_pos * size_factor + cursor_pos, cam_rot)
+    set_camera_transformation(camera, vert_matrix @ cam_pos * size_factor + cursor_pos, cam_rot)
     # Apply the transformation matrix for vertical orientation
     for i in range(4):
         coords[i].rotate(vert_matrix)
@@ -644,31 +642,42 @@ def update_scene(camera, cam_pos, cam_rot, is_vertical, scene, img_width, img_he
     rect.name = object_name_append(object_name, "_Cal")
     # Set the correct size (local coordinates)
     for i in range(4):
-        rect.data.vertices[rect.data.polygons[0].vertices[i]].co = coords[i] * size_factor
+        rect.data.vertices[rect.data.polygons[0].vertices[i]].co = coords[i] * size_factor    
+    m = camera.matrix_world.copy()
+    camera.parent = rect 
+    camera.matrix_world = m
 
 ### Operator F PR S ##############################################################
 
-class CameraCalibration_F_PR_S_Operator(bpy.types.Operator):
-    """Calibrates the focal length, position and rotation of the active camera."""
-    bl_idname = "camera.camera_calibration_f_pr_s"
+class CAMERACALIBRATION_OT_F_PR_S(bpy.types.Operator):
+    """Calibrates the focal length, position and rotation of the active camera.
+Selected object must be a mesh with 4 vertices in 1 polygon"""
+    bl_idname = "cameracalibration.f_pr_s"
     bl_label = "Solve Focal"
     bl_options = {"REGISTER", "UNDO"}
 
     # Properties
-    vertical_property = bpy.props.BoolProperty(name = "Vertical orientation", description = "Places the reconstructed rectangle in vertical orientation", default = False)
-    size_property = bpy.props.FloatProperty(name="Size", description = "Size of the reconstructed rectangle", default = 1.0, min = 0.0, soft_min = 0.0, unit = "LENGTH")
+    vertical_property: bpy.props.BoolProperty(name = "Vertical orientation", description = "Places the reconstructed rectangle in vertical orientation", default = True)
+    size_property: bpy.props.FloatProperty(name="Size", description = "Size of the reconstructed rectangle", default = 1.0, min = 0.0, soft_min = 0.0, unit = "LENGTH")
 
     @classmethod
     def poll(cls, context):
-        return context.active_object is not None and context.space_data.type == "VIEW_3D"
+        o = context.active_object
+        return o is not None and context.space_data.type == "VIEW_3D" and (
+            o.type == "MESH" and 
+            len(o.data.vertices) == 4 and 
+            len(o.data.polygons) == 1 and 
+            len(o.data.polygons[0].vertices) == 4 and 
+            len(o.data.edges) == 4
+        )
 
     def execute(self, context):
         # Get the camere of the scene
         scene = context.scene
         # Get the currently selected object
-        obj = bpy.context.object
+        obj = context.object
         # Check whether a mesh with 4 vertices in one polygon is selected
-        if not obj.data.name in bpy.data.meshes or not len(obj.data.vertices) == 4 or not len(obj.data.polygons) == 1 or not len(obj.data.polygons[0].vertices) == 4:
+        if obj.type != "MESH" or len(obj.data.vertices) != 4 or len(obj.data.polygons) != 1 or len(obj.data.polygons[0].vertices) != 4:
             self.report({'ERROR'}, "Selected object must be a mesh with 4 vertices in 1 polygon.")
             return {'CANCELLED'}
         # Get the vertex coordinates and transform them to get the global coordinates, then project to 2d
@@ -686,12 +695,11 @@ class CameraCalibration_F_PR_S_Operator(bpy.types.Operator):
             return {'CANCELLED'}
         print("Vertices:", pa, pb, pc, pd)
         # Get the background image data
-        img_data = get_background_image_data(bpy.context)
+        img_data = get_background_image_data(context)
         if not img_data:
-            self.report({'ERROR'}, "Exactly 1 visible background image required in top view.")
+            self.report({'ERROR'}, "Exactly 1 visible Image->background (empty) required in top view.")
             return {'CANCELLED'}
-        else:
-            offx, offy, rot, scale, flipx, flipy, w, h = img_data
+        empty, offx, offy, rot, scale, flipx, flipy, w, h = img_data
         # Scale is the horizontal dimension. If in portrait mode, use the vertical dimension.
         if h > w:
             scale = scale / w * h
@@ -708,34 +716,46 @@ class CameraCalibration_F_PR_S_Operator(bpy.types.Operator):
         set_camera_parameters(cam, lens = cam_focal)
         # Set extrinsic camera parameters and add a new rectangle
         update_scene(cam_obj, cam_pos, cam_rot, self.vertical_property, scene, w, h, obj.name, coords, size_factor)
+        update_camera_bg(cam_obj, empty.data)
         # Switch to the active camera
-        if not bpy.context.space_data.region_3d.view_perspective == "CAMERA":
-            bpy.ops.view3d.viewnumpad(type="CAMERA")
+        if not context.space_data.region_3d.view_perspective == "CAMERA":
+            bpy.ops.view3d.view_camera()
         return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)    
 
 ### Operator FX PR V #############################################################
 
-class CameraCalibration_FX_PR_V_Operator(bpy.types.Operator):
-    """Calibrates the focal length, vertical lens shift, position and rotation of the active camera."""
-    bl_idname = "camera.camera_calibration_fx_pr_v"
+class CAMERACALIBRATION_OT_FX_PR_V(bpy.types.Operator):
+    """Calibrates the focal length, vertical lens shift, position and rotation of the active camera.
+Selected object must be a mesh with 4 vertices in 1 polygon and one dangling vertex"""
+    bl_idname = "cameracalibration.fx_pr_v"
     bl_label = "Solve Focal+Y"
     bl_options = {"REGISTER", "UNDO"}
 
     # Properties
-    vertical_property = bpy.props.BoolProperty(name = "Vertical orientation", description = "Places the reconstructed rectangle in vertical orientation", default = False)
-    size_property = bpy.props.FloatProperty(name="Size", description = "Size of the reconstructed rectangle", default = 1.0, min = 0.0, soft_min = 0.0, unit = "LENGTH")
+    vertical_property: bpy.props.BoolProperty(name = "Vertical orientation", description = "Places the reconstructed rectangle in vertical orientation", default = True)
+    size_property: bpy.props.FloatProperty(name="Size", description = "Size of the reconstructed rectangle", default = 1.0, min = 0.0, soft_min = 0.0, unit = "LENGTH")
 
     @classmethod
     def poll(cls, context):
-        return context.active_object is not None and context.space_data.type == "VIEW_3D"
+        o = context.active_object
+        return o is not None and context.space_data.type == "VIEW_3D" and (
+            o.type == "MESH" and 
+            len(o.data.vertices) == 5 and 
+            len(o.data.polygons) == 1 and 
+            len(o.data.polygons[0].vertices) == 4 and 
+            len(o.data.edges) == 5
+        )
 
     def execute(self, context):
         # Get the camere of the scene
         scene = context.scene
         # Get the currently selected object
-        obj = bpy.context.object
+        obj = context.object
         # Check whether it is a mesh with 5 vertices, 4 in a polygon, 1 dangling at an edge
-        if not obj.data.name in bpy.data.meshes or not len(obj.data.vertices) == 5 or not len(obj.data.polygons) == 1 or not len(obj.data.polygons[0].vertices) == 4 or not len(obj.data.edges) == 5:
+        if obj.type != "MESH" or len(obj.data.vertices) != 5 or len(obj.data.polygons) != 1 or len(obj.data.polygons[0].vertices) != 4 or  len(obj.data.edges) != 5:
             self.report({'ERROR'}, "Selected object must be a mesh with 4 vertices in 1 polygon and one dangling vertex.")
             return {'CANCELLED'}
         # Get the edge that is not part of the polygon
@@ -772,12 +792,11 @@ class CameraCalibration_FX_PR_V_Operator(bpy.types.Operator):
             return {'CANCELLED'}
         print("Vertices:", pa, pb, pc, pd, pe, pf)
         # Get the background image data
-        img_data = get_background_image_data(bpy.context)
+        img_data = get_background_image_data(context)
         if not img_data:
-            self.report({'ERROR'}, "Exactly 1 visible background image required in top view.")
+            self.report({'ERROR'}, "Exactly 1 visible Image->background (empty) required in top view.")
             return {'CANCELLED'}
-        else:
-            offx, offy, rot, scale, flipx, flipy, w, h = img_data
+        empty, offx, offy, rot, scale, flipx, flipy, w, h = img_data
         # Scale is the horizontal dimension. If in portrait mode, use the vertical dimension.
         if h > w:
             scale = scale / w * h
@@ -793,34 +812,47 @@ class CameraCalibration_FX_PR_V_Operator(bpy.types.Operator):
         set_camera_parameters(cam, lens = cam_focal, shift_y = camera_shift)
         # Set extrinsic camera parameters and add a new rectangle
         update_scene(cam_obj, cam_pos, cam_rot, self.vertical_property, scene, w, h, obj.name, coords, size_factor)
+        update_camera_bg(cam_obj, empty.data)        
         # Switch to the active camera
-        if not bpy.context.space_data.region_3d.view_perspective == "CAMERA":
-            bpy.ops.view3d.viewnumpad(type="CAMERA")
+        if not context.space_data.region_3d.view_perspective == "CAMERA":
+            bpy.ops.view3d.view_camera()
         return {'FINISHED'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
 
 ### Operator FXY PR VV ############################################################
 
-class CameraCalibration_FXY_PR_VV_Operator(bpy.types.Operator):
-    """Calibrates the focal length, lens shift (horizontal and vertical), position and rotation of the active camera."""
-    bl_idname = "camera.camera_calibration_fxy_pr_vv"
+class CAMERACALIBRATION_OT_FXY_PR_VV(bpy.types.Operator):
+    """Calibrates the focal length, lens shift (horizontal and vertical), position and rotation of the active camera.
+Selected object must be a mesh with one polygon of 4 vertices with two dangling vertices"""
+
+    bl_idname = "cameracalibration.fxy_pr_vv"
     bl_label = "Solve Focal+X+Y"
     bl_options = {"REGISTER", "UNDO"}
 
     # Properties
-    vertical_property = bpy.props.BoolProperty(name = "Vertical orientation", description = "Places the reconstructed rectangle in vertical orientation", default = False)
-    size_property = bpy.props.FloatProperty(name="Size", description = "Size of the reconstructed rectangle", default = 1.0, min = 0.0, soft_min = 0.0, unit = "LENGTH")
+    vertical_property: bpy.props.BoolProperty(name = "Vertical orientation", description = "Places the reconstructed rectangle in vertical orientation", default = True)
+    size_property: bpy.props.FloatProperty(name="Size", description = "Size of the reconstructed rectangle", default = 1.0, min = 0.0, soft_min = 0.0, unit = "LENGTH")
 
     @classmethod
     def poll(cls, context):
-        return context.active_object is not None and context.space_data.type == "VIEW_3D"
+        o = context.active_object
+        return o is not None and context.space_data.type == "VIEW_3D" and (
+            o.type == "MESH" and 
+            len(o.data.vertices) == 6 and 
+            len(o.data.polygons) == 1 and 
+            len(o.data.polygons[0].vertices) == 4 and 
+            len(o.data.edges) == 6
+        )
 
     def execute(self, context):
         # Get the camere of the scene
         scene = context.scene
         # Get the currently selected object
-        obj = bpy.context.object
+        obj = context.object
         # Check whether it is a mesh with 6 vertices, 1 polygon, with 4 vertices and 2 dangling vertices
-        if not obj.data.name in bpy.data.meshes or not len(obj.data.vertices) == 6 or not len(obj.data.polygons) == 1 or not len(obj.data.polygons[0].vertices) == 4 or not len(obj.data.edges) == 6:
+        if obj.type != "MESH" or len(obj.data.vertices) != 6 or len(obj.data.polygons) != 1 or len(obj.data.polygons[0].vertices) != 4 or  len(obj.data.edges) != 6:
             self.report({'ERROR'}, "Selected object must be a mesh with one polygon of 4 vertices with two dangling vertices.")
             return {'CANCELLED'}
         # Get the edges that are not part of the polygon
@@ -860,12 +892,11 @@ class CameraCalibration_FXY_PR_VV_Operator(bpy.types.Operator):
             self.report({'ERROR'}, "Edges must not be parallel.")
             return {'CANCELLED'}
         # Get the background image data
-        img_data = get_background_image_data(bpy.context)
+        img_data = get_background_image_data(context)
         if not img_data:
-            self.report({'ERROR'}, "Exactly 1 visible background image required in top view.")
+            self.report({'ERROR'}, "Exactly 1 visible Image->background (empty) required in top view.")
             return {'CANCELLED'}
-        else:
-            offx, offy, rot, scale, flipx, flipy, w, h = img_data
+        empty, offx, offy, rot, scale, flipx, flipy, w, h = img_data
         # Scale is the horizontal dimension. If in portrait mode, use the vertical dimension.
         if h > w:
             scale = scale / w * h
@@ -883,50 +914,76 @@ class CameraCalibration_FXY_PR_VV_Operator(bpy.types.Operator):
         set_camera_parameters(cam, lens = cam_focal, shift_x = camera_shift_x, shift_y = camera_shift_y)
         # Set extrinsic camera parameters and add a new rectangle
         update_scene(cam_obj, cam_pos, cam_rot, self.vertical_property, scene, w, h, obj.name, coords, size_factor)
+        update_camera_bg(cam_obj, empty.data)       
         # Switch to the active camera
-        if not bpy.context.space_data.region_3d.view_perspective == "CAMERA":
-            bpy.ops.view3d.viewnumpad(type="CAMERA")
+        if not context.space_data.region_3d.view_perspective == "CAMERA":
+            bpy.ops.view3d.view_camera()
         return {'FINISHED'}
+    
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+
+class CAMERACALIBRATION_OT_add_image(ImportHelper, bpy.types.Operator):
+    """Add a background image in top view
+    """
+    bl_idname = "cameracalibration.add_image"
+    bl_label = "Add background image"
+    bl_options = {"REGISTER", "UNDO"}
+    filename_ext = ".jpg,.png"
+    filter_glob: bpy.props.StringProperty(
+            default="*.jpg;*.png",
+            options={'HIDDEN'},
+            )
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+
+    def execute(self, context):
+        bpy.ops.view3d.view_axis(type="TOP")
+        bpy.ops.object.load_background_image(filepath=self.filepath)
+        return {'FINISHED'}
+
 
 ### Panel ########################################################################
 
-class CameraCalibrationPanel(bpy.types.Panel):
+class CAMERACALIBRATION_PT_main(bpy.types.Panel):
     """Creates a Panel in the scene context of the properties editor"""
     bl_label = "Camera Calibration PVR"
-    bl_idname = "VIEW_3D_camera_calibration"
+    bl_idname = "CAMERACALIBRATION_PT_main"
     bl_space_type = 'VIEW_3D'
-    bl_region_type = 'TOOLS'
-    bl_category = "Tools"
+    bl_region_type = 'UI'
+    bl_category = "Camera calibration"
 
     def draw(self, context):
         layout = self.layout
-        layout.operator("camera.camera_calibration_f_pr_s")
-        layout.operator("camera.camera_calibration_fx_pr_v")
-        layout.operator("camera.camera_calibration_fxy_pr_vv")
+        layout.operator("cameracalibration.add_image")        
+        layout.operator("mesh.primitive_plane_add", text="Add reference plane")        
+        layout.operator("cameracalibration.f_pr_s")
+        layout.operator("cameracalibration.fx_pr_v")
+        layout.operator("cameracalibration.fxy_pr_vv")
+
 
 ## Addons Preferences Update Panel
 def update_panel(self, context):
     try:
-        bpy.utils.unregister_class(CameraCalibrationPanel)
+        bpy.utils.unregister_class(CAMERACALIBRATION_PT_main)
     except:
         pass
-    CameraCalibrationPanel.bl_category = context.user_preferences.addons[__name__].preferences.category
-    bpy.utils.register_class(CameraCalibrationPanel)
+    CAMERACALIBRATION_PT_main.bl_category = context.preferences.addons[__name__].preferences.category
+    bpy.utils.register_class(CAMERACALIBRATION_PT_main)
 
 
-class LayerMAddonPreferences(bpy.types.AddonPreferences):
+class CAMERACALIBRATION_AddonPreferences(bpy.types.AddonPreferences):
     # this must match the addon name, use '__package__'
     # when defining this in a submodule of a python package.
     bl_idname = __name__
 
-    category = bpy.props.StringProperty(
+    category: bpy.props.StringProperty(
             name="Panel Category",
             description="Choose a name for the category of the panel",
-            default="Tools",
+            default="Camera calibration",
             update=update_panel)
 
     def draw(self, context):
-
         layout = self.layout
         row = layout.row()
         row.label(text="Panel Category:")
@@ -934,12 +991,24 @@ class LayerMAddonPreferences(bpy.types.AddonPreferences):
 
 ### Register #####################################################################
 
+classes = (
+    CAMERACALIBRATION_AddonPreferences,
+    CAMERACALIBRATION_OT_F_PR_S,
+    CAMERACALIBRATION_OT_FX_PR_V,
+    CAMERACALIBRATION_OT_FXY_PR_VV,
+    CAMERACALIBRATION_OT_add_image,
+    CAMERACALIBRATION_PT_main
+)
+
+
 def register():
-    bpy.utils.register_module(__name__)
+    for cls in classes:
+        bpy.utils.register_class(cls)
     update_panel(None, bpy.context)
 
 def unregister():
-    bpy.utils.unregister_module(__name__)
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
 
 if __name__ == "__main__":
     register()
